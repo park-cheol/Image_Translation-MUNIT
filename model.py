@@ -26,8 +26,7 @@ class AdaptiveInstanceNorm2d(nn.Module):
         # batchnorm에서 running_mean은 매개변수는 아니지만 상태로써 사용
 
     def forward(self, input):
-        assert (self.weight is not None and self.bias is not None),
-        "weibt와 bias를 지정"
+        assert (self.weight is not None and self.bias is not None), "weibt와 bias를 지정"
         b, c, h, w = input.size()
         running_mean = self.running_mean.repeat(b) # batch 수만큼 곱
         running_var = self.running_var.repeat(b)
@@ -92,7 +91,7 @@ class LayerNorm(nn.Module):
         if self.affine:
             shape = [1, -1] + [1] * (input.dim() - 2) # todo 만약 input이 [B,C,H,W] => [1, -1, 1, 1]
             input = input * self.gamma.view(*shape) + self.beta.view(*shape)
-            # todo afiine은 채널과 무슨 관련이 있는지에 대해서
+            # todo affine은 채널과 무슨 관련이 있는지에 대해서
 
         return input
 
@@ -179,9 +178,195 @@ class StyleEncoder(nn.Module):
     #todo style_dim= paer)fck: k filter 가진 FC layer = 8개의 class를 가지다는 것인대 그럼 8개의 다양한 스타일을 가지다는뜻?
     def __init__(self, in_channels=3, dim=64, n_downsample=2, style_dim=8):
         super(StyleEncoder, self).__init__()
-        # todo downsample 마지막부분 생각
+        downsample = []
+
+        # init_conv_block
+        self.first_conv_layer = nn.Sequential(nn.ReflectionPad2d(3),
+                                         nn.Conv2d(in_channels, dim, 7),
+                                         nn.ReLU(inplace=True))
+
+        # Downsample
+        for _ in range(2):
+            downsample += [nn.Conv2d(dim, dim * 2, 4, stride=2, padding=1),
+                           nn.ReLU(inplace=True)]
+            dim *= 2
+
+        # 채널은 같은 downsample
+        for _ in range(n_downsample - 2):
+            downsample += [nn.Conv2d(dim, dim, 4, stride=2, padding=1),
+                           nn.ReLU(inplace=True)]
+
+        self.adapAvgPool = nn.AdaptiveAvgPool2d(1)
+        self.style_layer = nn.Conv2d(dim, style_dim, 1, 1, 0)
+
+        self.downsample_layer = nn.Sequential(*downsample)
+
+    def forward(self, input):
+        first_conv_layer = self.first_conv_layer(input)
+        downsample = self.downsample_layer(first_conv_layer)
+
+        adapAvgPool = self.adapAvgPool(downsample)
+        output = self.style_layer(adapAvgPool)
+
+        return output
+
+#############################
+# Encoder
+#############################
+
+class Encoder(nn.Module):
+
+    def __init__(self, in_channels=3, dim=64, n_residual=3, n_downsample=2, style_dim=8):
+        super(Encoder, self).__init__()
+        self.content_encoder = ContentEncoder(in_channels, dim, n_residual, n_downsample)
+        self.style_encoder = StyleEncoder(in_channels, dim, n_residual, style_dim)
+
+    def forward(self, input):
+        content_code = self.content_encoder(input)
+        style_code = self.style_encoder(input)
+
+        return content_code, style_code
+
+#################################
+#            Decoder
+#################################
+
+class Decoder(nn.Module):
+
+    def __init__(self, out_channels=3, dim=64, n_residual=3, n_upsample=2, style_dim=8):
+        super(Decoder, self).__init__()
+        dim = dim * 2 ** n_upsample
+
+        residual = []
+        for _ in range(n_residual):
+            residual += [ResidualBlock(dim, norm='adain')]
+
+        self.residual_block = nn.Sequential(*residual)
+
+        upsample = []
+        for _ in range(n_upsample):
+            upsample += [
+                nn.Upsample(2),
+                nn.Conv2d(dim, dim // 2, 5, stride=1, padding=1),
+                LayerNorm(dim // 2),
+                nn.ReLU(inplace=True)
+            ]
+            dim = dim // 2
+
+        self.upsample_block = nn.Sequential(*upsample)
+
+        self.last_layer = nn.Sequential(nn.ReflectionPad2d(3),
+                                   nn.Conv2d(dim, out_channels, 7),
+                                   nn.Tanh())
+
+        num_adain_params = self.get_num_adain_params()
+        self.mlp = MLP(style_dim, num_adain_params) # todo adain parameter Update 위한것가?
+
+    def get_num_adain_params(self):
+        num_adain_params = 0
+        for m in self.modules():
+            if m.__class__.__name__ == 'AdaptiveInstanceNorm2d':
+                num_adain_params += 2 * m.num_features # todo num_features??
+                # assign adain params 위해서 2배
+        return num_adain_params
+
+    def assign_adain_params(self, adain_params): # adain params 할당
+        for m in self.modules():
+            if m.__class__.__name__ == "AdaptiveInstanceNorm2d":
+                mean = adain_params[:, :m.num_features]
+                std = adain_params[:, m.num_features:2 * m.num_features]
+                # Update
+                m.bias = mean.contiguous().view(-1)
+                m.weight = std.contiguous().view(-1)
+                # move pointer todo ???
+                if adain_params.size(1) > 2 * m.num_features:
+                    adain_params = adain_params[:, 2 * m.num_features:] # crop
+
+    def forward(self, content_code, style_code):
+        adain_param = self.mlp(style_code)
+        self.assign_adain_params(adain_param)
+
+        residual_layer = self.residual_block(content_code)
+        upsample_layer = self.upsample_block(residual_layer)
+        image = self.last_layer(upsample_layer)
+
+        return image
 
 
+#################################
+#            MLP(Adain parameters predit)
+#################################
+
+class MLP(nn.Module):
+
+    def __init__(self, input_dim, output_dim, dim=256, n_blk=3, activ="relu"):
+        super(MLP, self).__init__()
+
+        self.first_layer = nn.Sequential(nn.Linear(input_dim, dim),
+                                         nn.ReLU(inplace=True))
+
+        layers = []
+
+        for _ in range(n_blk -2):
+            layers += [nn.Linear(dim, dim),
+                       nn.ReLU(inplace=True)]
+
+        self.last_layer = nn.Linear(dim, output_dim)
+        self.mid_layer = nn.Sequential(*layers)
+
+    def forward(self, input): # style_encoder를 input으로 받음
+        reshaped_input = input.view(input.size(0), -1) # batch빼고 다 통합
+        first_layer = self.first_layer(reshaped_input)
+        mid_layer = self.mid_layer(first_layer)
+        last_layer = self.last_layer(mid_layer)
+
+        return last_layer
+
+
+#############################
+# multiDiscriminator
+#############################
+
+class MultiDiscriminator(nn.Module):
+    # 일반적인 discriminator인듯
+    def __init__(self, in_channels=3):
+        super(MultiDiscriminator, self).__init__()
+
+        def discriminator_block(in_filters, out_filters, normalize=True):
+            """Returns downsampling layers of each discriminator block"""
+            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalize:
+                layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        # Extracts three discriminator models
+        self.models = nn.ModuleList()
+        for i in range(3):
+            self.models.add_module(
+                "disc_%d" % i,
+                nn.Sequential(
+                    *discriminator_block(in_channels, 64, normalize=False),
+                    *discriminator_block(64, 128),
+                    *discriminator_block(128, 256),
+                    *discriminator_block(256, 512),
+                    nn.Conv2d(512, 1, 3, padding=1)
+                ),
+            )
+
+        self.downsample = nn.AvgPool2d(in_channels, stride=2, padding=[1, 1], count_include_pad=False)
+
+    def compute_loss(self, x, gt):
+        """Computes the MSE between model output and scalar gt"""
+        loss = sum([torch.mean((out - gt) ** 2) for out in self.forward(x)])
+        return loss
+
+    def forward(self, x):
+        outputs = []
+        for m in self.models:
+            outputs.append(m(x))
+            x = self.downsample(x)
+        return outputs
 
 
 
